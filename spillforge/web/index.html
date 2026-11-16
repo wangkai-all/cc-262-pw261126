@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SpillForge · 磁盘感知排序服务</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="mark"></span>
+    <div>
+      <h1>SpillForge</h1>
+      <p class="sub">真实外部排序 / 去重 / 关联 · 账本化磁盘与内存预算</p>
+    </div>
+  </div>
+  <div class="topbar-right">
+    <label class="policy">
+      <span>调度策略</span>
+      <select id="policy">
+        <option value="fairness">公平（短作业优先+老化）</option>
+        <option value="throughput">吞吐（FIFO 单通道）</option>
+        <option value="adaptive">自适应（压力切换）</option>
+      </select>
+    </label>
+    <button id="recover" class="ghost" title="扫描崩溃/取消遗留并释放额度">运行恢复</button>
+    <span id="conn" class="conn" title="轮询状态">●</span>
+  </div>
+</header>
+
+<main>
+  <section class="gauges" id="gauges">
+    <article class="gauge" id="gauge-disk">
+      <div class="gauge-head"><h2>临时磁盘</h2><span class="num" data-k="disk-num">—</span></div>
+      <div class="bar"><div class="fill disk" data-k="disk-fill"></div><div class="marker" data-k="disk-marker"></div></div>
+      <dl>
+        <div><dt>预算</dt><dd data-k="disk-budget">—</dd></div>
+        <div><dt>已预留</dt><dd data-k="disk-reserved">—</dd></div>
+        <div><dt>实际占用</dt><dd data-k="disk-actual">—</dd></div>
+        <div><dt>保留结果</dt><dd data-k="disk-kept">—</dd></div>
+        <div><dt>已承诺合计</dt><dd data-k="disk-committed">—</dd></div>
+        <div><dt>可准入</dt><dd data-k="disk-admit">—</dd></div>
+        <div><dt>卷剩余</dt><dd data-k="disk-free">—</dd></div>
+      </dl>
+      <p class="hint">预留是上限承诺；实际占用从文件 stat 校准。保留结果与预留一样占用预算，所以“已承诺合计”才是准入依据；高水位线 <span data-k="disk-hwm">—</span> 处切入公平调度。</p>
+    </article>
+    <article class="gauge" id="gauge-mem">
+      <div class="gauge-head"><h2>排序内存</h2><span class="num" data-k="mem-num">—</span></div>
+      <div class="bar"><div class="fill mem" data-k="mem-fill"></div></div>
+      <dl>
+        <div><dt>预算</dt><dd data-k="mem-budget">—</dd></div>
+        <div><dt>已预留</dt><dd data-k="mem-reserved">—</dd></div>
+        <div><dt>缓冲区在用</dt><dd data-k="mem-actual">—</dd></div>
+        <div><dt>可准入</dt><dd data-k="mem-admit">—</dd></div>
+      </dl>
+      <p class="hint">内存预算决定单次排序缓冲与归并路数；不是 RSS 断言。</p>
+    </article>
+    <article class="gauge wide">
+      <div class="gauge-head"><h2>调度与公平</h2><span class="tag" id="policy-tag">—</span></div>
+      <dl class="inline">
+        <div><dt>并发执行</dt><dd data-k="active-jobs">—</dd></div>
+        <div><dt>排队</dt><dd data-k="queued-jobs">—</dd></div>
+        <div><dt>停放(预算)</dt><dd data-k="paused-jobs">—</dd></div>
+        <div><dt>已保留结果</dt><dd data-k="kept-count">—</dd></div>
+        <div><dt>债务总额</dt><dd data-k="debt-total">—</dd></div>
+      </dl>
+      <p class="hint" id="fairness-note">短作业优先让排队延迟下降，代价是交错 I/O 和更细的归并；老化保证大作业不被饿死。</p>
+    </article>
+  </section>
+
+  <section class="panel submit">
+    <h2>提交作业</h2>
+    <div class="submit-grid">
+      <div class="dropzone" id="drop">
+        <input type="file" id="file" hidden>
+        <p><strong>拖入或选择真实文件</strong></p>
+        <p class="muted">UTF-8 文本，每行 <code>key&lt;TAB&gt;payload</code>；排序按整行字节序。</p>
+        <button class="ghost" id="pick">选择文件</button>
+        <p id="upload-info" class="muted"></p>
+      </div>
+      <div class="demo">
+        <p><strong>或生成合成数据</strong>（用于小预算演示真实落盘）</p>
+        <div class="row">
+          <label>记录数 <input type="number" id="demo-records" value="6000" min="100" step="1000"></label>
+          <label>热点偏斜 <input type="number" id="demo-skew" value="24" min="1" max="200"></label>
+          <label class="check"><input type="checkbox" id="demo-sorted"> 已排序输入</label>
+          <button class="ghost" id="gen-demo">生成</button>
+        </div>
+      </div>
+      <div class="compose">
+        <div class="row">
+          <label>作业类型
+            <select id="kind">
+              <option value="sort">排序 sort</option>
+              <option value="dedupe">去重 dedupe</option>
+              <option value="join">关联 join</option>
+            </select>
+          </label>
+          <label id="second-wrap" hidden>第二输入（build 侧）
+            <select id="second-upload"></select>
+          </label>
+        </div>
+        <div class="row">
+          <input type="text" id="job-name" placeholder="作业名称（可选）">
+          <label class="check"><input type="checkbox" id="inject-crash"> 在下次运行注入“归并中途崩溃”</label>
+        </div>
+        <button id="submit" class="primary">提交</button>
+        <p class="muted" id="submit-msg"></p>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>作业</h2>
+      <div class="row tight">
+        <label class="check"><input type="checkbox" id="show-done"> 显示已结束</label>
+        <select id="fault-select" title="故障注入点：下次调度时在该边界中止执行">
+          <option value="">不注入故障</option>
+          <option value="after_run_complete">分片写完</option>
+          <option value="mid_merge">归并到一半</option>
+          <option value="before_budget_release">释放预算前</option>
+          <option value="after_publish_before_release">发布后释放前</option>
+          <option value="after_final_write_before_seal">最终写入未封存</option>
+          <option value="during_scatter">重分区散列中</option>
+          <option value="after_bucket_sorted">桶排序完成</option>
+          <option value="during_partition">关联分区中</option>
+          <option value="mid_join_bucket">逐桶连接中</option>
+        </select>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table id="jobs">
+        <thead>
+          <tr>
+            <th>作业</th><th>类型</th><th>状态 / 阶段</th><th>输入</th>
+            <th>计划</th><th>磁盘预留</th><th>进度</th><th>操作</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p class="empty" id="jobs-empty">还没有作业。上传一个文件或生成合成数据。</p>
+    </div>
+  </section>
+
+  <section class="panel split">
+    <div>
+      <div class="panel-head"><h2>账本流水</h2><span class="muted">最近 60 条，含余额快照</span></div>
+      <div class="table-wrap ledger">
+        <table id="ledger">
+          <thead><tr><th>时间</th><th>作业</th><th>动作</th><th>预留Δ</th><th>实际Δ</th><th>预留/实际余额</th><th>原因</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+    <div>
+      <div class="panel-head"><h2>事件</h2><span class="muted" id="event-count"></span></div>
+      <ol class="events" id="events"></ol>
+    </div>
+  </section>
+
+  <section class="panel split">
+    <div>
+      <div class="panel-head"><h2>输入文件</h2><span class="muted">上传与生成的数据保留在磁盘上</span></div>
+      <ul class="uploads" id="uploads"></ul>
+    </div>
+    <div>
+      <div class="panel-head"><h2>恢复与故障</h2><span class="muted">演示真实崩溃恢复</span></div>
+      <div class="recover-box">
+        <p>恢复流程会核对计划点、清理未完成分片、校准实际占用、释放不可行工作区。</p>
+        <div class="row tight">
+          <button class="ghost" id="recover2">立即运行恢复</button>
+          <button class="ghost danger" id="reset">清空所有数据</button>
+        </div>
+        <pre id="recovery-report" class="report">尚无恢复记录。</pre>
+        <p class="muted">故障注入会以真实异常中止执行线程，模拟进程崩溃；随后恢复会保留已完成分片并重新入队。</p>
+      </div>
+    </div>
+  </section>
+</main>
+
+<dialog id="detail">
+  <div class="dialog-head">
+    <h2 id="detail-title">作业详情</h2>
+    <form method="dialog"><button class="ghost">关闭</button></form>
+  </div>
+  <div id="detail-body"></div>
+</dialog>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
